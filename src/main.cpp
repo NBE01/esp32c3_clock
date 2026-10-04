@@ -100,17 +100,35 @@ void setup() {
                 (!selected && (address == 0x3C || address == 0x3D))) selected = address;
         }
     }
+    Serial.println("I2C scan complete.");
     if (selected) {
         oled.setI2CAddress(selected << 1);
         oled.setBusClock(100000);
-        oled.begin();
+        Serial.printf("OLED init start (model=%d, address=0x%02X).\n", OLED_MODEL, selected);
+        // U8g2 configures the GPIOs before starting Wire. Release the scanner's
+        // bus so Wire.begin() restores the hardware I2C pin configuration.
+        Wire.end();
+        Serial.println("Scanner I2C bus released.");
+        // Same steps as oled.begin(), with logs to locate initialization stalls.
+        oled.initDisplay();
+        Serial.println("OLED init commands complete.");
+        oled.clearDisplay();
+        Serial.println("OLED clear complete.");
+        oled.setPowerSave(0);
+        Serial.println("OLED init complete.");
         displayReady = true;
     } else {
         Serial.println("OLED not found. Check power, GND, SDA=D4, SCL=D5; then reset.");
     }
+    Serial.println("Setup complete; starting clock loop.");
 }
 
 void loop() {
+    static bool firstLoop = true;
+    if (firstLoop) {
+        Serial.println("Clock loop entered.");
+        firstLoop = false;
+    }
     readCommands();
     static time_t previous = 0;
     const time_t now = time(nullptr);

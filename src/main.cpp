@@ -1,9 +1,12 @@
 #include <Arduino.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <esp_sntp.h>
 #include <sys/time.h>
 #include <time.h>
 #include "config.h"
+#include "wifi_config.h"
 
 #if OLED_MODEL == 0
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, kSclPin, kSdaPin);
@@ -17,9 +20,66 @@ U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, kSclPin, kSd
 
 bool displayReady = false;
 bool buildTimeUsed = false;
+bool ntpTimeUsed = false;
+enum class SyncState { Idle, Connecting, WaitingForNtp };
+SyncState syncState = SyncState::Idle;
+uint32_t lastSyncAttempt = 0;
+uint32_t syncStageStarted = 0;
 char input[64];
 size_t inputLength = 0;
 bool inputOverflow = false;
+
+void startTimeSync() {
+    lastSyncAttempt = millis();
+    syncStageStarted = lastSyncAttempt;
+    syncState = SyncState::Connecting;
+    Serial.println("NTP: connecting to Wi-Fi.");
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(false);
+    WiFi.begin(kWifiSsid, kWifiPassword);
+}
+
+void finishTimeSync(const char *message) {
+    // Stop SNTP's automatic polling; only our daily schedule starts it again.
+    if (syncState == SyncState::WaitingForNtp) esp_sntp_stop();
+    WiFi.disconnect(true);
+    syncState = SyncState::Idle;
+    Serial.println(message);
+}
+
+void updateTimeSync() {
+    if (!kWifiSsid[0]) return;
+    const uint32_t nowMs = millis();
+    if (syncState == SyncState::Idle) {
+        // Unsigned subtraction also works across the millis() rollover.
+        if (static_cast<uint32_t>(nowMs - lastSyncAttempt) >= kNtpIntervalMs) {
+            startTimeSync();
+        }
+    } else if (syncState == SyncState::Connecting) {
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.printf("NTP: requesting time from %s.\n", kNtpServer);
+            sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
+            sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
+            sntp_set_sync_interval(kNtpIntervalMs);
+            configTzTime(kTimezone, kNtpServer);
+            syncStageStarted = millis();
+            syncState = SyncState::WaitingForNtp;
+        } else if (static_cast<uint32_t>(nowMs - syncStageStarted) >= kWifiTimeoutMs) {
+            finishTimeSync("NTP: Wi-Fi timeout; keeping clock, next attempt in 24-hour cycle.");
+        }
+    } else {
+        // Check actual SNTP completion, not whether the build-time clock is valid.
+        if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+            buildTimeUsed = false;
+            ntpTimeUsed = true;
+            finishTimeSync("NTP: synchronized (JST); Wi-Fi off until next daily attempt.");
+        } else if (WiFi.status() != WL_CONNECTED) {
+            finishTimeSync("NTP: Wi-Fi disconnected; keeping clock, next attempt in 24-hour cycle.");
+        } else if (static_cast<uint32_t>(nowMs - syncStageStarted) >= kNtpTimeoutMs) {
+            finishTimeSync("NTP: response timeout; keeping clock, next attempt in 24-hour cycle.");
+        }
+    }
+}
 
 void handleCommand(const char *line) {
     if (strcmp(line, "help") == 0) {
@@ -53,6 +113,7 @@ void handleCommand(const char *line) {
     timeval value = {epoch, 0};
     if (settimeofday(&value, nullptr) == 0) {
         buildTimeUsed = false;
+        ntpTimeUsed = false;
         Serial.println("Clock set (JST).");
     } else {
         Serial.println("Clock update failed.");
@@ -121,6 +182,9 @@ void setup() {
         Serial.println("OLED not found. Check power, GND, SDA=D4, SCL=D5; then reset.");
     }
     Serial.println("Setup complete; starting clock loop.");
+    WiFi.persistent(false);
+    if (kWifiSsid[0]) startTimeSync();
+    else Serial.println("NTP disabled: set WIFI_SSID and WIFI_PASSWORD in .env, then upload.");
 }
 
 void loop() {
@@ -130,6 +194,7 @@ void loop() {
         firstLoop = false;
     }
     readCommands();
+    updateTimeSync();
     static time_t previous = 0;
     const time_t now = time(nullptr);
     if (now != previous) {
@@ -149,7 +214,8 @@ void loop() {
             oled.drawStr((128 - oled.getStrWidth(clock)) / 2, oled.getDisplayHeight() == 32 ? 31 : 39, clock);
             if (oled.getDisplayHeight() >= 64) {
                 oled.setFont(u8g2_font_6x10_tf);
-                oled.drawStr(0, 60, buildTimeUsed ? "BUILD TIME / SET USB" : "INTERNAL CLOCK");
+                oled.drawStr(0, 60, buildTimeUsed ? "BUILD TIME / SET USB" :
+                    (ntpTimeUsed ? "NTP / INTERNAL CLOCK" : "INTERNAL CLOCK"));
             }
             oled.sendBuffer();
         }

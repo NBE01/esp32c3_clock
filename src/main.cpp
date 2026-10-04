@@ -1,0 +1,140 @@
+#include <Arduino.h>
+#include <U8g2lib.h>
+#include <Wire.h>
+#include <sys/time.h>
+#include <time.h>
+#include "config.h"
+
+#if OLED_MODEL == 0
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, kSclPin, kSdaPin);
+#elif OLED_MODEL == 1
+U8G2_SH1106_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, kSclPin, kSdaPin);
+#elif OLED_MODEL == 2
+U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, kSclPin, kSdaPin);
+#else
+#error Unsupported OLED_MODEL
+#endif
+
+bool displayReady = false;
+bool buildTimeUsed = false;
+char input[64];
+size_t inputLength = 0;
+bool inputOverflow = false;
+
+void handleCommand(const char *line) {
+    if (strcmp(line, "help") == 0) {
+        Serial.println("Set JST: set YYYY-MM-DD HH:MM:SS (then Enter)");
+        return;
+    }
+    int y, m, d, h, min, s;
+    char extra;
+    if (sscanf(line, "set %d-%d-%d %d:%d:%d %c", &y, &m, &d, &h, &min, &s, &extra) != 6 ||
+        y < 2024 || y > 2037 || m < 1 || m > 12 || d < 1 || d > 31 ||
+        h < 0 || h > 23 || min < 0 || min > 59 || s < 0 || s > 59) {
+        Serial.println("Invalid command/date. Use: set YYYY-MM-DD HH:MM:SS (2024-2037, JST)");
+        return;
+    }
+    tm requested = {};
+    requested.tm_year = y - 1900;
+    requested.tm_mon = m - 1;
+    requested.tm_mday = d;
+    requested.tm_hour = h;
+    requested.tm_min = min;
+    requested.tm_sec = s;
+    requested.tm_isdst = -1;
+    const time_t epoch = mktime(&requested);
+    tm checked = {};
+    localtime_r(&epoch, &checked);
+    if (epoch < 0 || checked.tm_year != y - 1900 || checked.tm_mon != m - 1 ||
+        checked.tm_mday != d || checked.tm_hour != h || checked.tm_min != min || checked.tm_sec != s) {
+        Serial.println("Invalid calendar date.");
+        return;
+    }
+    timeval value = {epoch, 0};
+    if (settimeofday(&value, nullptr) == 0) {
+        buildTimeUsed = false;
+        Serial.println("Clock set (JST).");
+    } else {
+        Serial.println("Clock update failed.");
+    }
+}
+
+void readCommands() {
+    while (Serial.available()) {
+        const char c = Serial.read();
+        if (c == '\r' || c == '\n') {
+            if (inputOverflow) Serial.println("Command too long; discarded.");
+            else if (inputLength) {
+                input[inputLength] = '\0';
+                handleCommand(input);
+            }
+            inputLength = 0;
+            inputOverflow = false;
+        } else if (!inputOverflow) {
+            if (inputLength < sizeof(input) - 1) input[inputLength++] = c;
+            else inputOverflow = true;
+        }
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(1500);
+    setenv("TZ", kTimezone, 1);
+    tzset();
+    // Preserve an existing valid system clock, including after supported resets.
+    if (time(nullptr) < 1704067200) {
+        timeval initial = {static_cast<time_t>(BUILD_EPOCH), 0};
+        settimeofday(&initial, nullptr);
+        buildTimeUsed = true;
+    }
+    Serial.println("XIAO ESP32-C3 clock / JST. Type help for time setting.");
+    Wire.begin(kSdaPin, kSclPin);
+    Wire.setClock(100000);
+    uint8_t selected = 0;
+    for (uint8_t address = 1; address < 127; ++address) {
+        Wire.beginTransmission(address);
+        if (Wire.endTransmission() == 0) {
+            Serial.printf("I2C device: 0x%02X\n", address);
+            if (kOledAddress ? address == kOledAddress :
+                (!selected && (address == 0x3C || address == 0x3D))) selected = address;
+        }
+    }
+    if (selected) {
+        oled.setI2CAddress(selected << 1);
+        oled.setBusClock(100000);
+        oled.begin();
+        displayReady = true;
+    } else {
+        Serial.println("OLED not found. Check power, GND, SDA=D4, SCL=D5; then reset.");
+    }
+}
+
+void loop() {
+    readCommands();
+    static time_t previous = 0;
+    const time_t now = time(nullptr);
+    if (now != previous) {
+        previous = now;
+        tm local = {};
+        localtime_r(&now, &local);
+        char date[16], clock[16];
+        strftime(date, sizeof(date), "%Y-%m-%d", &local);
+        strftime(clock, sizeof(clock), "%H:%M:%S", &local);
+        Serial.printf("%s %s JST%s\n", date, clock, buildTimeUsed ? " (build time estimate)" : "");
+        if (displayReady) {
+            oled.clearBuffer();
+            oled.setFont(u8g2_font_6x10_tf);
+            oled.drawStr(0, 10, date);
+            oled.drawStr(108, 10, "JST");
+            oled.setFont(u8g2_font_logisoso16_tn);
+            oled.drawStr((128 - oled.getStrWidth(clock)) / 2, oled.getDisplayHeight() == 32 ? 31 : 39, clock);
+            if (oled.getDisplayHeight() >= 64) {
+                oled.setFont(u8g2_font_6x10_tf);
+                oled.drawStr(0, 60, buildTimeUsed ? "BUILD TIME / SET USB" : "INTERNAL CLOCK");
+            }
+            oled.sendBuffer();
+        }
+    }
+    delay(10);
+}

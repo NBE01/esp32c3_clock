@@ -1,0 +1,6 @@
+.pio/
+.vscode/*
+!.vscode/extensions.json
+__pycache__/
+*.pyc
+.env
